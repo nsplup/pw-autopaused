@@ -17,6 +17,8 @@ var (
 	nodesMu         sync.RWMutex
 	devsMu          sync.RWMutex
 
+	currentDefaultSink string
+
 	GlobalNodes   = make(map[int]Node)
 	GlobalDevices = make(map[int]Device)
 
@@ -83,6 +85,23 @@ type MetadataUpdate struct {
 
 // --- 逻辑实现 ---
 
+func GetDeviceIDByNodeName(nodeName string) (int, bool) {
+    nodeID, ok := GetNodeIDByName(nodeName)
+    if !ok {
+				// fmt.Printf("[Debug] 未找到名为 %s confirmed 的 Node\n", nodeName)
+        return 0, false
+    }
+    
+    nodesMu.RLock()
+    node, exists := GlobalNodes[nodeID]
+    nodesMu.RUnlock()
+    
+    if !exists {
+        return 0, false
+    }
+    return node.Info.Props.DeviceID, true
+}
+
 // ParseRouteProperties 解析 Route 中的 info 数组
 func ParseRouteProperties(infoArray []interface{}) RouteData {
 	data := RouteData{
@@ -118,37 +137,18 @@ func GetHighestPriorityOutputRoute(dev Device) (RouteInfo, bool) {
 	return outputRoutes[0], true
 }
 
-// getCategoryByPortType 根据 port.type 字符串判断分类
-func getCategoryByPortType(portType string) string {
-	portType = strings.ToLower(portType)
-	for _, kw := range privateDevice {
-		if strings.Contains(portType, kw) {
-			return "【私有设备】"
-		}
-	}
-	for _, kw := range publicDevice {
-		if strings.Contains(portType, kw) {
-			return "【公共设备】"
-		}
-	}
-	return "未知类型"
-}
 
-// checkDeviceCategory 适配重构后的逻辑
-func checkDeviceCategory(deviceID int, keywords []string) bool {
-	devsMu.RLock()
-	dev, ok := GlobalDevices[deviceID]
-	devsMu.RUnlock()
-	if !ok {
-		return false
-	}
-
+func checkDeviceCategory(dev Device, keywords []string) bool {
+	// 1. 获取该设备中优先级最高的输出路由
 	topRoute, ok := GetHighestPriorityOutputRoute(dev)
 	if !ok {
 		return false
 	}
 
+	// 2. 解析路由属性
 	parsed := ParseRouteProperties(topRoute.Info)
+	// fmt.Printf("[Debug] Device %d Route Props: %v\n", dev.ID, parsed.Properties)
+	// 3. 匹配关键词
 	if portType, exists := parsed.Properties["port.type"]; exists {
 		portType = strings.ToLower(portType)
 		for _, kw := range keywords {
@@ -160,17 +160,29 @@ func checkDeviceCategory(deviceID int, keywords []string) bool {
 	return false
 }
 
-func IsPublicDevice(deviceID int) bool {
-	return checkDeviceCategory(deviceID, publicDevice)
+func IsPublicDevice(dev Device) bool {
+	return checkDeviceCategory(dev, publicDevice)
 }
 
-func IsPrivateDevice(deviceID int) bool {
-	return checkDeviceCategory(deviceID, privateDevice)
+func IsPrivateDevice(dev Device) bool {
+	return checkDeviceCategory(dev, privateDevice)
 }
 
 // --- 处理逻辑 ---
 
 func handleDefaultRouteChange(newDev Device) {
+	// 1. 获取当前默认 Sink 对应的 Device ID
+	currentDevID, ok := GetDeviceIDByNodeName(currentDefaultSink)
+	if !ok {
+		return
+	}
+
+	// 2. 只有当发生变化的设备正是当前的默认输出设备时，才继续逻辑
+	if newDev.ID != currentDevID {
+		return
+	}
+
+	// 3. 获取旧的设备信息（从缓存中）
 	devsMu.RLock()
 	oldDev, exists := GlobalDevices[newDev.ID]
 	devsMu.RUnlock()
@@ -179,28 +191,12 @@ func handleDefaultRouteChange(newDev Device) {
 		return
 	}
 
-	oldRoute, oldOk := GetHighestPriorityOutputRoute(oldDev)
-	newRoute, newOk := GetHighestPriorityOutputRoute(newDev)
+	// fmt.Printf("%v\n", IsPrivateDevice(oldDev))
+	// fmt.Printf("%v\n", IsPublicDevice(newDev))
 
-	// 如果新旧状态至少有一个没有输出路由，则不处理对比
-	if !oldOk || !newOk {
-		return
-	}
-
-	oldProps := ParseRouteProperties(oldRoute.Info)
-	newProps := ParseRouteProperties(newRoute.Info)
-
-	oldPortType := oldProps.Properties["port.type"]
-	newPortType := newProps.Properties["port.type"]
-
-	// 只有当 port.type 发生变化时才触发
-	if oldPortType != newPortType && newPortType != "" {
-		oldCat := getCategoryByPortType(oldPortType)
-		newCat := getCategoryByPortType(newPortType)
-
-		fmt.Printf("[Event] 设备内部路由变化 (Device ID: %d):\n", newDev.ID)
-		fmt.Printf(" -> 从: %s (%s)\n", oldPortType, oldCat)
-		fmt.Printf(" -> 到: %s (%s)\n", newPortType, newCat)
+	// 4. 调用转换判断逻辑
+	if IsPrivateDevice(oldDev) && IsPublicDevice(newDev) {
+		fmt.Printf("[Logic] 检测到路由自动切换：从私有状态(Headphones) 切换到了 公共状态(Speaker)！\n")
 	}
 }
 
@@ -238,40 +234,66 @@ func onNodeUpdate(data []byte) {
 }
 
 func handleDefaultSinkChange(metadata []MetadataEntry) {
-	for _, entry := range metadata {
-		if entry.Key == "default.configured.audio.sink" {
-			IsUserOperation = true
-			var nodeName string
-			if valMap, ok := entry.Value.(map[string]interface{}); ok {
-				if name, ok := valMap["name"].(string); ok {
-					nodeName = name
-				}
-			} else {
-				nodeName = fmt.Sprintf("%v", entry.Value)
-			}
+    for _, entry := range metadata {
+        // 1. 只处理我们关心的 Key，避免其他 Metadata 干扰 nodeName 的解析
+        if entry.Key != "default.audio.sink" && entry.Key != "default.configured.audio.sink" {
+            continue
+        }
 
-			if nodeName == "" {
-				continue
-			}
+        // 2. 解析 nodeName
+        var nodeName string
+        switch v := entry.Value.(type) {
+        case map[string]interface{}:
+            nodeName, _ = v["name"].(string)
+        case string:
+            var subMap map[string]interface{}
+            if err := json.Unmarshal([]byte(v), &subMap); err == nil {
+                nodeName, _ = subMap["name"].(string)
+            } else {
+                nodeName = strings.Trim(v, "\"")
+            }
+        }
 
-			if id, ok := GetNodeIDByName(nodeName); ok {
-				nodesMu.RLock()
-				node := GlobalNodes[id]
-				nodesMu.RUnlock()
-				
-				devID := node.Info.Props.DeviceID
-				fmt.Printf("[Event] 用户切换 Sink 为: %s (Device ID: %d)\n", nodeName, devID)
-				
-				if IsPrivateDevice(devID) {
-					fmt.Println(" -> 识别结果: 【私有设备】 (Headphones/Headset)")
-				} else if IsPublicDevice(devID) {
-					fmt.Println(" -> 识别结果: 【公共设备】 (Speaker/HDMI/DP)")
-				} else {
-					fmt.Println(" -> 识别结果: 未知类型设备")
-				}
-			}
-		}
-	}
+        if nodeName == "" {
+            continue
+        }
+
+        // 3. 处理逻辑
+        switch entry.Key {
+        case "default.audio.sink":
+            fmt.Printf("[Debug] 检测到 Sink 变化，目标节点: %s (当前记录为: %s)\n", nodeName, currentDefaultSink)
+            
+            // 如果是第一次运行（currentDefaultSink为空），只赋值不判断逻辑
+            if currentDefaultSink == "" {
+                currentDefaultSink = nodeName
+                fmt.Printf("[Init] 初始默认 Sink 设置为: %s\n", nodeName)
+                continue
+            }
+
+            // 获取新旧设备信息进行判断
+            oldDevID, oldOk := GetDeviceIDByNodeName(currentDefaultSink)
+            newDevID, newOk := GetDeviceIDByNodeName(nodeName)
+
+            if oldOk && newOk {
+                devsMu.RLock()
+                oldDev := GlobalDevices[oldDevID]
+                newDev := GlobalDevices[newDevID]
+                devsMu.RUnlock()
+                
+                if IsPrivateDevice(oldDev) && IsPublicDevice(newDev) {
+                    fmt.Printf("[Logic] 检测到 Sink 切换：从私有状态 切换到了 公共状态！\n")
+                }
+            }
+
+            // 无论判断是否通过，都要更新当前变量
+            currentDefaultSink = nodeName
+            IsUserOperation = false
+
+        case "default.configured.audio.sink":
+            IsUserOperation = true
+            fmt.Printf("[Event] 用户切换 Sink 为: %s \n", nodeName)
+        }
+    }
 }
 
 func onMetadataUpdate(data []byte) {
