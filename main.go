@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"sort"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/godbus/dbus/v5"
+	"go.uber.org/zap"
 )
 
 var (
@@ -83,19 +85,19 @@ type MetadataUpdate struct {
 }
 
 func GetDeviceIDByNodeName(nodeName string) (int, bool) {
-    nodeID, ok := GetNodeIDByName(nodeName)
-    if !ok {
-			return 0, false
-    }
-    
-    nodesMu.RLock()
-    node, exists := GlobalNodes[nodeID]
-    nodesMu.RUnlock()
-    
-    if !exists {
-			return 0, false
-    }
-    return node.Info.Props.DeviceID, true
+	nodeID, ok := GetNodeIDByName(nodeName)
+	if !ok {
+		return 0, false
+	}
+
+	nodesMu.RLock()
+	node, exists := GlobalNodes[nodeID]
+	nodesMu.RUnlock()
+
+	if !exists {
+		return 0, false
+	}
+	return node.Info.Props.DeviceID, true
 }
 
 func ParseRouteProperties(infoArray []interface{}) RouteData {
@@ -131,7 +133,6 @@ func GetHighestPriorityOutputRoute(dev Device) (RouteInfo, bool) {
 	return outputRoutes[0], true
 }
 
-
 func checkDeviceCategory(dev Device, keywords []string) bool {
 	topRoute, ok := GetHighestPriorityOutputRoute(dev)
 	if !ok {
@@ -161,16 +162,16 @@ func IsPrivateDevice(dev Device) bool {
 func pauseAllPlayers(ctx context.Context) {
 	conn, err := dbus.SessionBus()
 	if err != nil {
-		fmt.Printf("[ERROR] 无法连接 DBus 会话总线: %v", err)
+		zap.L().Error("无法连接 DBus 会话总线", zap.Error(err))
 		return
 	}
 	defer conn.Close()
 
 	var names []string
-	
+
 	err = conn.BusObject().Call("org.freedesktop.DBus.ListNames", 0).Store(&names)
 	if err != nil {
-		fmt.Printf("[ERROR] 获取名单列表失败：%v", err)
+		zap.L().Error("获取名单列表失败", zap.Error(err))
 		return
 	}
 
@@ -191,7 +192,7 @@ func pauseAllPlayers(ctx context.Context) {
 			select {
 			case <-done:
 			case <-time.After(200 * time.Millisecond):
-				fmt.Printf("[WARN] 暂停播放器 %s 时超时", name)
+				zap.L().Warn("暂停播放器时超时", zap.String("player", name))
 			case <-ctx.Done():
 				return
 			}
@@ -208,9 +209,9 @@ func setPipewireMute(nodeID string, mute bool) {
 	cmd := exec.Command("pw-cli", "set-param", nodeID, "Props", param)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
-	
+
 	cmd.Start()
-	
+
 	go cmd.Wait()
 }
 
@@ -226,7 +227,7 @@ func pauseWithMute(nodeID string) {
 		select {
 		case <-time.After(500 * time.Millisecond):
 		case <-ctx.Done():
-			fmt.Println("[WARN] 操作超时")
+			zap.L().Warn("操作超时")
 			return
 		}
 
@@ -257,7 +258,7 @@ func handleDefaultRouteChange(newDev Device) {
 		return
 	}
 	if IsPrivateDevice(oldDev) && IsPublicDevice(newDev) {
-		fmt.Printf("[Event] 检测到路由自动切换：从私有状态(Headphones) 切换到了 公共状态(Speaker)！\n")
+		zap.L().Info("检测到路由切换：从【私人设备】切换到了【公共设备】")
 		nodeIDStr := fmt.Sprintf("%d", nodeID)
 		pauseWithMute(nodeIDStr)
 	}
@@ -321,7 +322,7 @@ func handleDefaultSinkChange(metadata []MetadataEntry) {
 		case "default.audio.sink":
 			if currentDefaultSink == "" {
 				currentDefaultSink = nodeName
-				fmt.Printf("[Init] 初始默认 Sink 设置为: %s\n", nodeName)
+				zap.L().Info("默认 Sink 初始化为", zap.String("node", nodeName))
 				continue
 			}
 
@@ -334,9 +335,9 @@ func handleDefaultSinkChange(metadata []MetadataEntry) {
 				oldDev := GlobalDevices[oldDevID]
 				newDev := GlobalDevices[newDevID]
 				devsMu.RUnlock()
-				
+
 				if !IsUserOperation && IsPrivateDevice(oldDev) && IsPublicDevice(newDev) {
-					fmt.Printf("[Event] 检测到 Sink 切换：从私有状态 切换到了 公共状态！\n")
+					zap.L().Info("检测到 Sink 切换：从【私人设备】切换到了【公共设备】")
 					nodeIDStr := fmt.Sprintf("%d", nodeID)
 					pauseWithMute(nodeIDStr)
 				}
@@ -375,7 +376,20 @@ func dispatcher(rawObjects []json.RawMessage) {
 }
 
 func main() {
-	cmd := exec.Command("pw-dump", "--monitor")
+	cfg := zap.NewDevelopmentConfig()
+
+	cfg.EncoderConfig.TimeKey = ""
+	cfg.EncoderConfig.CallerKey = ""
+
+	logger, _ := cfg.Build()
+	zap.ReplaceGlobals(logger)
+
+	defer logger.Sync()
+	zap.ReplaceGlobals(logger)
+
+	zap.L().Info("正在监听 PipeWire 事件...")
+
+	cmd := exec.Command("pw-dump", "--monitor", "--no-colors")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		panic(err)
@@ -383,8 +397,6 @@ func main() {
 	if err := cmd.Start(); err != nil {
 		panic(err)
 	}
-
-	fmt.Println("正在监听 PipeWire 设备切换事件...")
 
 	decoder := json.NewDecoder(stdout)
 	for {
@@ -398,4 +410,6 @@ func main() {
 		dispatcher(rawObjects)
 	}
 	cmd.Wait()
+	zap.L().Error("监听器意外退出")
+	os.Exit(1)
 }
