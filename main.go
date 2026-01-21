@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -8,6 +9,9 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/godbus/dbus/v5"
 )
 
 var (
@@ -81,7 +85,7 @@ type MetadataUpdate struct {
 func GetDeviceIDByNodeName(nodeName string) (int, bool) {
     nodeID, ok := GetNodeIDByName(nodeName)
     if !ok {
-        return 0, false
+			return 0, false
     }
     
     nodesMu.RLock()
@@ -89,7 +93,7 @@ func GetDeviceIDByNodeName(nodeName string) (int, bool) {
     nodesMu.RUnlock()
     
     if !exists {
-        return 0, false
+			return 0, false
     }
     return node.Info.Props.DeviceID, true
 }
@@ -154,6 +158,82 @@ func IsPrivateDevice(dev Device) bool {
 	return checkDeviceCategory(dev, privateDevice)
 }
 
+func pauseAllPlayers(ctx context.Context) {
+	conn, err := dbus.SessionBus()
+	if err != nil {
+		fmt.Printf("[ERROR] 无法连接 DBus 会话总线: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	var names []string
+	
+	err = conn.BusObject().Call("org.freedesktop.DBus.ListNames", 0).Store(&names)
+	if err != nil {
+		fmt.Printf("[ERROR] 获取名单列表失败：%v", err)
+		return
+	}
+
+	for _, name := range names {
+		if strings.HasPrefix(name, "org.mpris.MediaPlayer2.") {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			done := make(chan error, 1)
+			go func(playerName string) {
+				call := conn.Object(playerName, "/org/mpris/MediaPlayer2").Call("org.mpris.MediaPlayer2.Player.Pause", 0)
+				done <- call.Err
+			}(name)
+
+			select {
+			case <-done:
+			case <-time.After(200 * time.Millisecond):
+				fmt.Printf("[WARN] 暂停播放器 %s 时超时", name)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+func setPipewireMute(nodeID string, mute bool) {
+	volume := "1.0"
+	if mute {
+		volume = "0.0"
+	}
+	param := fmt.Sprintf(`{ "volume": %s }`, volume)
+	cmd := exec.Command("pw-cli", "set-param", nodeID, "Props", param)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	
+	cmd.Start()
+	
+	go cmd.Wait()
+}
+
+func pauseWithMute(nodeID string) {
+	setPipewireMute(nodeID, true)
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		pauseAllPlayers(ctx)
+
+		select {
+		case <-time.After(500 * time.Millisecond):
+		case <-ctx.Done():
+			fmt.Println("[WARN] 操作超时")
+			return
+		}
+
+		setPipewireMute(nodeID, false)
+	}()
+}
+
 func handleDefaultRouteChange(newDev Device) {
 	currentDevID, ok := GetDeviceIDByNodeName(currentDefaultSink)
 	if !ok {
@@ -172,8 +252,14 @@ func handleDefaultRouteChange(newDev Device) {
 		return
 	}
 
+	nodeID, nOk := GetNodeIDByName(currentDefaultSink)
+	if !nOk {
+		return
+	}
 	if IsPrivateDevice(oldDev) && IsPublicDevice(newDev) {
 		fmt.Printf("[Event] 检测到路由自动切换：从私有状态(Headphones) 切换到了 公共状态(Speaker)！\n")
+		nodeIDStr := fmt.Sprintf("%d", nodeID)
+		pauseWithMute(nodeIDStr)
 	}
 }
 
@@ -241,8 +327,9 @@ func handleDefaultSinkChange(metadata []MetadataEntry) {
 
 			oldDevID, oldOk := GetDeviceIDByNodeName(currentDefaultSink)
 			newDevID, newOk := GetDeviceIDByNodeName(nodeName)
+			nodeID, nOk := GetNodeIDByName(nodeName)
 
-			if oldOk && newOk {
+			if oldOk && newOk && nOk {
 				devsMu.RLock()
 				oldDev := GlobalDevices[oldDevID]
 				newDev := GlobalDevices[newDevID]
@@ -250,6 +337,8 @@ func handleDefaultSinkChange(metadata []MetadataEntry) {
 				
 				if !IsUserOperation && IsPrivateDevice(oldDev) && IsPublicDevice(newDev) {
 					fmt.Printf("[Event] 检测到 Sink 切换：从私有状态 切换到了 公共状态！\n")
+					nodeIDStr := fmt.Sprintf("%d", nodeID)
+					pauseWithMute(nodeIDStr)
 				}
 			}
 
