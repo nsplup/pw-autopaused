@@ -1,5 +1,11 @@
 package main
 
+/*
+#cgo pkg-config: libpipewire-0.3
+
+#include "pipewire_mute.h"
+*/
+import "C"
 import (
 	"context"
 	"encoding/json"
@@ -17,11 +23,11 @@ import (
 )
 
 var (
-	IsUserOperation bool
+	IsUserOperation    bool
+	currentDefaultSink string
+
 	nodesMu         sync.RWMutex
 	devsMu          sync.RWMutex
-
-	currentDefaultSink string
 
 	GlobalNodes   = make(map[int]Node)
 	GlobalDevices = make(map[int]Device)
@@ -159,64 +165,56 @@ func IsPrivateDevice(dev Device) bool {
 	return checkDeviceCategory(dev, privateDevice)
 }
 
+func setPipewireMute(nodeID string, mute bool) {
+	id := 0
+	_, err := fmt.Sscanf(nodeID, "%d", &id)
+	if err != nil {
+		return
+	}
+
+	C.pw_mute_set(C.uint32_t(id), C.bool(mute))
+}
+
 func pauseAllPlayers(ctx context.Context) {
 	conn, err := dbus.SessionBus()
 	if err != nil {
 		zap.L().Error("无法连接 DBus 会话总线", zap.Error(err))
 		return
 	}
-	defer conn.Close()
 
 	var names []string
-
 	err = conn.BusObject().Call("org.freedesktop.DBus.ListNames", 0).Store(&names)
 	if err != nil {
 		zap.L().Error("获取名单列表失败", zap.Error(err))
+		conn.Close()
 		return
 	}
 
+	var wg sync.WaitGroup
+
 	for _, name := range names {
 		if strings.HasPrefix(name, "org.mpris.MediaPlayer2.") {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-
-			done := make(chan error, 1)
+			wg.Add(1)
 			go func(playerName string) {
-				call := conn.Object(playerName, "/org/mpris/MediaPlayer2").Call("org.mpris.MediaPlayer2.Player.Pause", 0)
-				done <- call.Err
-			}(name)
+				defer wg.Done()
 
-			select {
-			case <-done:
-			case <-time.After(200 * time.Millisecond):
-				zap.L().Warn("暂停播放器时超时", zap.String("player", name))
-			case <-ctx.Done():
-				return
-			}
+				call := conn.Object(playerName, "/org/mpris/MediaPlayer2").Call("org.mpris.MediaPlayer2.Player.Pause", 0)
+
+				if call.Err != nil {
+					zap.L().Debug("暂停播放器失败", zap.String("player", playerName), zap.Error(call.Err))
+				}
+			}(name)
 		}
 	}
-}
 
-func setPipewireMute(nodeID string, mute bool) {
-	volume := "1.0"
-	if mute {
-		volume = "0.0"
-	}
-	param := fmt.Sprintf(`{ "volume": %s }`, volume)
-	cmd := exec.Command("pw-cli", "set-param", nodeID, "Props", param)
-	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
-
-	cmd.Start()
-
-	go cmd.Wait()
+	go func() {
+		wg.Wait()
+		conn.Close() 
+	}()
 }
 
 func pauseWithMute(nodeID string) {
-	setPipewireMute(nodeID, true)
+	go setPipewireMute(nodeID, true)
 
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -227,7 +225,7 @@ func pauseWithMute(nodeID string) {
 		select {
 		case <-time.After(500 * time.Millisecond):
 		case <-ctx.Done():
-			zap.L().Warn("操作超时")
+			zap.L().Warn("暂停播放器时超时")
 			return
 		}
 
@@ -258,7 +256,7 @@ func handleDefaultRouteChange(newDev Device) {
 		return
 	}
 	if IsPrivateDevice(oldDev) && IsPublicDevice(newDev) {
-		zap.L().Info("检测到路由切换：从【私人设备】切换到了【公共设备】")
+		zap.L().Info("Route 切换：从【私人设备】切换到了【公共设备】")
 		nodeIDStr := fmt.Sprintf("%d", nodeID)
 		pauseWithMute(nodeIDStr)
 	}
@@ -337,7 +335,7 @@ func handleDefaultSinkChange(metadata []MetadataEntry) {
 				devsMu.RUnlock()
 
 				if !IsUserOperation && IsPrivateDevice(oldDev) && IsPublicDevice(newDev) {
-					zap.L().Info("检测到 Sink 切换：从【私人设备】切换到了【公共设备】")
+					zap.L().Info("Sink  切换：从【私人设备】切换到了【公共设备】")
 					nodeIDStr := fmt.Sprintf("%d", nodeID)
 					pauseWithMute(nodeIDStr)
 				}
@@ -377,25 +375,28 @@ func dispatcher(rawObjects []json.RawMessage) {
 
 func main() {
 	cfg := zap.NewDevelopmentConfig()
-
 	cfg.EncoderConfig.TimeKey = ""
 	cfg.EncoderConfig.CallerKey = ""
-
 	logger, _ := cfg.Build()
 	zap.ReplaceGlobals(logger)
-
 	defer logger.Sync()
-	zap.ReplaceGlobals(logger)
+
+	zap.L().Info("正在启动 PipeWire 客户端...")
+
+	if ret := C.pw_mute_init(); ret != 0 {
+		zap.L().Fatal("无法启动 PipeWire 客户端")
+	}
+	defer C.pw_mute_deinit()
 
 	zap.L().Info("正在监听 PipeWire 事件...")
 
 	cmd := exec.Command("pw-dump", "--monitor", "--no-colors")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		panic(err)
+		zap.L().Fatal("无法创建监听器管道", zap.Error(err))
 	}
 	if err := cmd.Start(); err != nil {
-		panic(err)
+		zap.L().Fatal("无法启动监听器", zap.Error(err))
 	}
 
 	decoder := json.NewDecoder(stdout)
@@ -403,13 +404,18 @@ func main() {
 		var rawObjects []json.RawMessage
 		if err := decoder.Decode(&rawObjects); err != nil {
 			if err == io.EOF {
+				zap.L().Info("事件流结束")
 				break
 			}
+			zap.L().Warn("解码错误", zap.Error(err))
 			continue
 		}
 		dispatcher(rawObjects)
 	}
-	cmd.Wait()
-	zap.L().Error("监听器意外退出")
-	os.Exit(1)
+
+	err = cmd.Wait()
+	if err != nil {
+		zap.L().Error("监听进程异常退出", zap.Error(err))
+		os.Exit(1)
+	}
 }
