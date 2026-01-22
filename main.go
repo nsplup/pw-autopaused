@@ -13,7 +13,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -106,37 +105,19 @@ func GetDeviceIDByNodeName(nodeName string) (int, bool) {
 	return node.Info.Props.DeviceID, true
 }
 
-func ParseRouteProperties(infoArray []interface{}) RouteData {
-	data := RouteData{
-		Properties: make(map[string]string),
-	}
-	if len(infoArray) < 3 {
-		return data
-	}
-	for i := 1; i+1 < len(infoArray); i += 2 {
-		key, kOk := infoArray[i].(string)
-		val, vOk := infoArray[i+1].(string)
-		if kOk && vOk {
-			data.Properties[key] = val
-		}
-	}
-	return data
-}
-
 func GetHighestPriorityOutputRoute(dev Device) (RouteInfo, bool) {
-	var outputRoutes []RouteInfo
+	var bestRoute RouteInfo
+	found := false
+
 	for _, r := range dev.Info.Params.Route {
 		if strings.EqualFold(r.Direction, "output") {
-			outputRoutes = append(outputRoutes, r)
+			if !found || r.Priority > bestRoute.Priority {
+				bestRoute = r
+				found = true
+			}
 		}
 	}
-	if len(outputRoutes) == 0 {
-		return RouteInfo{}, false
-	}
-	sort.Slice(outputRoutes, func(i, j int) bool {
-		return outputRoutes[i].Priority > outputRoutes[j].Priority
-	})
-	return outputRoutes[0], true
+	return bestRoute, found
 }
 
 func checkDeviceCategory(dev Device, keywords []string) bool {
@@ -145,13 +126,24 @@ func checkDeviceCategory(dev Device, keywords []string) bool {
 		return false
 	}
 
-	parsed := ParseRouteProperties(topRoute.Info)
-	if portType, exists := parsed.Properties["port.type"]; exists {
-		portType = strings.ToLower(portType)
-		for _, kw := range keywords {
-			if strings.Contains(portType, kw) {
-				return true
+	info := topRoute.Info
+	if len(info) < 3 {
+		return false
+	}
+
+	for i := 1; i+1 < len(info); i += 2 {
+		key, kOk := info[i].(string)
+		if kOk && key == "port.type" {
+			val, vOk := info[i+1].(string)
+			if vOk {
+				portType := strings.ToLower(val)
+				for _, kw := range keywords {
+					if strings.Contains(portType, kw) {
+						return true
+					}
+				}
 			}
+			break
 		}
 	}
 	return false
