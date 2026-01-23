@@ -88,6 +88,7 @@ type MetadataUpdate struct {
 func GetDeviceIDByNodeName(nodeName string) (int, bool) {
 	nodeID, ok := GetNodeIDByName(nodeName)
 	if !ok {
+		// zap.L().Warn("无法找到节点索引", zap.String("name", nodeName))
 		return 0, false
 	}
 
@@ -96,6 +97,7 @@ func GetDeviceIDByNodeName(nodeName string) (int, bool) {
 	nodesMu.RUnlock()
 
 	if !exists {
+		// zap.L().Warn("无法找到节点", zap.Int("id", nodeID))
 		return 0, false
 	}
 	return node.Info.Props.DeviceID, true
@@ -254,7 +256,7 @@ func handleDefaultRouteChange(newDev Device) {
 		return
 	}
 	if IsPrivateDevice(oldDev) && IsPublicDevice(newDev) {
-		// FIX: 无法通过静音输出设备彻底屏蔽正在输出的流
+		// FIXME: 无法通过静音输出设备彻底屏蔽正在输出的流
 		zap.L().Info("暂停播放器，触发事件为【设备路由变更】")
 		pauseWithMute(nodeID)
 	}
@@ -316,12 +318,6 @@ func handleDefaultSinkChange(metadata []MetadataEntry) {
 
 		switch entry.Key {
 		case "default.audio.sink":
-			if currentDefaultSink == "" {
-				currentDefaultSink = nodeName
-				zap.L().Info("默认输出设备初始化为", zap.String("sink", nodeName))
-				continue
-			}
-
 			oldDevID, oldOk := GetDeviceIDByNodeName(currentDefaultSink)
 			newDevID, newOk := GetDeviceIDByNodeName(nodeName)
 			nodeID, nOk := GetNodeIDByName(nodeName)
@@ -338,6 +334,9 @@ func handleDefaultSinkChange(metadata []MetadataEntry) {
 				}
 			}
 
+			if currentDefaultSink == "" {
+				zap.L().Info("默认输出设备初始化为", zap.String("sink", nodeName))
+			}
 			currentDefaultSink = nodeName
 			IsUserOperation = false
 		case "default.configured.audio.sink":
