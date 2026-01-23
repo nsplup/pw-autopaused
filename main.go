@@ -1,11 +1,5 @@
 package main
 
-/*
-#cgo pkg-config: libpipewire-0.3
-
-#include "pipewire_mute.h"
-*/
-import "C"
 import (
 	"context"
 	"encoding/json"
@@ -24,9 +18,11 @@ import (
 var (
 	IsUserOperation    bool
 	currentDefaultSink string
+	pwCliStdin io.WriteCloser
 
 	nodesMu         sync.RWMutex
 	devsMu          sync.RWMutex
+	stdinMu    sync.Mutex
 
 	GlobalNodes   = make(map[int]Node)
 	GlobalDevices = make(map[int]Device)
@@ -157,20 +153,30 @@ func IsPrivateDevice(dev Device) bool {
 	return checkDeviceCategory(dev, privateDevice)
 }
 
-func setPipewireMute(nodeID string, mute bool) {
-	id := 0
-	_, err := fmt.Sscanf(nodeID, "%d", &id)
-	if err != nil {
+func setPipewireMute(nodeID int, mute bool) {
+	if pwCliStdin == nil {
 		return
 	}
 
-	C.pw_mute_set(C.uint32_t(id), C.bool(mute))
+	volume := "[1.0, 1.0]"
+	if mute {
+		volume = "[0.0, 0.0]"
+	}
+
+	cmd := fmt.Sprintf("set-param %d Props { channelVolumes: %s }\n", nodeID, volume)
+
+	stdinMu.Lock()
+	defer stdinMu.Unlock()
+	_, err := io.WriteString(pwCliStdin, cmd)
+	if err != nil {
+		zap.L().Error("向控制进程发送指令失败", zap.Error(err))
+	}
 }
 
 func pauseAllPlayers(ctx context.Context) {
 	conn, err := dbus.SessionBus()
 	if err != nil {
-		zap.L().Error("无法连接 DBus 会话总线", zap.Error(err))
+		zap.L().Error("无法连接会话总线", zap.Error(err))
 		return
 	}
 
@@ -205,7 +211,7 @@ func pauseAllPlayers(ctx context.Context) {
 	}()
 }
 
-func pauseWithMute(nodeID string) {
+func pauseWithMute(nodeID int) {
 	go setPipewireMute(nodeID, true)
 
 	go func() {
@@ -215,7 +221,7 @@ func pauseWithMute(nodeID string) {
 		pauseAllPlayers(ctx)
 
 		select {
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(1000 * time.Millisecond):
 		case <-ctx.Done():
 			zap.L().Warn("暂停播放器时超时")
 			return
@@ -248,9 +254,9 @@ func handleDefaultRouteChange(newDev Device) {
 		return
 	}
 	if IsPrivateDevice(oldDev) && IsPublicDevice(newDev) {
-		zap.L().Info("Route 切换：从【私人设备】切换到了【公共设备】")
-		nodeIDStr := fmt.Sprintf("%d", nodeID)
-		pauseWithMute(nodeIDStr)
+		// FIX: 无法通过静音输出设备彻底屏蔽正在输出的流
+		zap.L().Info("暂停播放器，触发事件为【设备路由变更】")
+		pauseWithMute(nodeID)
 	}
 }
 
@@ -312,7 +318,7 @@ func handleDefaultSinkChange(metadata []MetadataEntry) {
 		case "default.audio.sink":
 			if currentDefaultSink == "" {
 				currentDefaultSink = nodeName
-				zap.L().Info("默认 Sink 初始化为", zap.String("node", nodeName))
+				zap.L().Info("默认输出设备初始化为", zap.String("sink", nodeName))
 				continue
 			}
 
@@ -327,9 +333,8 @@ func handleDefaultSinkChange(metadata []MetadataEntry) {
 				devsMu.RUnlock()
 
 				if !IsUserOperation && IsPrivateDevice(oldDev) && IsPublicDevice(newDev) {
-					zap.L().Info("Sink  切换：从【私人设备】切换到了【公共设备】")
-					nodeIDStr := fmt.Sprintf("%d", nodeID)
-					pauseWithMute(nodeIDStr)
+					zap.L().Info("暂停播放器，触发事件为【输出设备变更】")
+					pauseWithMute(nodeID)
 				}
 			}
 
@@ -373,41 +378,64 @@ func main() {
 	zap.ReplaceGlobals(logger)
 	defer logger.Sync()
 
-	zap.L().Info("正在启动 PipeWire 客户端...")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	if ret := C.pw_mute_init(); ret != 0 {
-		zap.L().Fatal("无法启动 PipeWire 客户端")
-	}
-	defer C.pw_mute_deinit()
+	zap.L().Info("正在启动控制进程...")
 
-	zap.L().Info("正在监听 PipeWire 事件...")
-
-	cmd := exec.Command("pw-dump", "--monitor", "--no-colors")
-	stdout, err := cmd.StdoutPipe()
+	cliCmd := exec.CommandContext(ctx, "pw-cli")
+	var err error
+	pwCliStdin, err = cliCmd.StdinPipe()
 	if err != nil {
-		zap.L().Fatal("无法创建监听器管道", zap.Error(err))
+		zap.L().Fatal("无法创建控制进程输入管道", zap.Error(err))
 	}
-	if err := cmd.Start(); err != nil {
-		zap.L().Fatal("无法启动监听器", zap.Error(err))
+	if err := cliCmd.Start(); err != nil {
+		zap.L().Fatal("无法启动控制进程", zap.Error(err))
 	}
 
-	decoder := json.NewDecoder(stdout)
-	for {
-		var rawObjects []json.RawMessage
-		if err := decoder.Decode(&rawObjects); err != nil {
-			if err == io.EOF {
-				zap.L().Info("事件流结束")
+	go func() {
+		err := cliCmd.Wait()
+		zap.L().Warn("控制进程已退出", zap.Error(err))
+		cancel()
+	}()
+
+	zap.L().Info("正在启动监听进程...")
+
+	dumpCmd := exec.CommandContext(ctx, "pw-dump", "--monitor", "--no-colors")
+	stdout, err := dumpCmd.StdoutPipe()
+	if err != nil {
+		zap.L().Fatal("无法创建监听进程输出管道", zap.Error(err))
+	}
+	if err := dumpCmd.Start(); err != nil {
+		zap.L().Fatal("无法启动监听进程", zap.Error(err))
+	}
+
+	go func() {
+		zap.L().Info("正在监听事件...")
+		decoder := json.NewDecoder(stdout)
+		for {
+			var rawObjects []json.RawMessage
+			if err := decoder.Decode(&rawObjects); err != nil {
+				if err == io.EOF {
+					break
+				}
+				zap.L().Warn("从监听进程解析事件发生错误", zap.Error(err))
 				break
 			}
-			zap.L().Warn("解码错误", zap.Error(err))
-			continue
+			dispatcher(rawObjects)
 		}
-		dispatcher(rawObjects)
-	}
+		cancel()
+	}()
 
-	err = cmd.Wait()
-	if err != nil {
-		zap.L().Error("监听进程异常退出", zap.Error(err))
-		os.Exit(1)
-	}
+	go func() {
+		err := dumpCmd.Wait()
+		zap.L().Warn("监听进程已退出", zap.Error(err))
+		cancel()
+	}()
+
+	<-ctx.Done()
+	
+	zap.L().Info("子进程意外退出，正在退出主进程...")
+	time.Sleep(500 * time.Millisecond)
+	os.Exit(1)
 }
