@@ -19,6 +19,7 @@ var (
 	IsUserOperation    bool
 	currentDefaultSink string
 	pwCliStdin io.WriteCloser
+	dbusConn *dbus.Conn
 
 	nodesMu         sync.RWMutex
 	devsMu          sync.RWMutex
@@ -34,6 +35,7 @@ var (
 type PwObject struct {
 	ID   int    `json:"id"`
 	Type string `json:"type"`
+	Info json.RawMessage `json:"info"`
 }
 
 type Node struct {
@@ -88,7 +90,7 @@ type MetadataUpdate struct {
 func GetDeviceIDByNodeName(nodeName string) (int, bool) {
 	nodeID, ok := GetNodeIDByName(nodeName)
 	if !ok {
-		// zap.L().Warn("无法找到节点索引", zap.String("name", nodeName))
+		zap.L().Debug("无法找到节点索引", zap.String("name", nodeName))
 		return 0, false
 	}
 
@@ -97,7 +99,7 @@ func GetDeviceIDByNodeName(nodeName string) (int, bool) {
 	nodesMu.RUnlock()
 
 	if !exists {
-		// zap.L().Warn("无法找到节点", zap.Int("id", nodeID))
+		zap.L().Debug("无法找到节点", zap.Int("id", nodeID))
 		return 0, false
 	}
 	return node.Info.Props.DeviceID, true
@@ -176,41 +178,35 @@ func setPipewireMute(nodeID int, mute bool) {
 }
 
 func pauseAllPlayers(ctx context.Context) {
-	conn, err := dbus.SessionBus()
-	if err != nil {
-		zap.L().Error("无法连接会话总线", zap.Error(err))
+	if dbusConn == nil {
+		zap.L().Error("未建立与会话总线的连接")
 		return
 	}
 
 	var names []string
-	err = conn.BusObject().Call("org.freedesktop.DBus.ListNames", 0).Store(&names)
+	err := dbusConn.BusObject().CallWithContext(ctx, "org.freedesktop.DBus.ListNames", 0).Store(&names)
 	if err != nil {
 		zap.L().Error("获取名单列表失败", zap.Error(err))
-		conn.Close()
 		return
 	}
 
 	var wg sync.WaitGroup
-
 	for _, name := range names {
 		if strings.HasPrefix(name, "org.mpris.MediaPlayer2.") {
 			wg.Add(1)
 			go func(playerName string) {
 				defer wg.Done()
-
-				call := conn.Object(playerName, "/org/mpris/MediaPlayer2").Call("org.mpris.MediaPlayer2.Player.Pause", 0)
+				
+				obj := dbusConn.Object(playerName, "/org/mpris/MediaPlayer2")
+				call := obj.CallWithContext(ctx, "org.mpris.MediaPlayer2.Player.Pause", 0)
 
 				if call.Err != nil {
-					zap.L().Debug("暂停播放器失败", zap.String("player", playerName), zap.Error(call.Err))
+					zap.L().Warn("尝试暂停播放器失败", zap.String("player", playerName), zap.Error(call.Err))
 				}
 			}(name)
 		}
 	}
-
-	go func() {
-		wg.Wait()
-		conn.Close() 
-	}()
+	wg.Wait() 
 }
 
 func pauseWithMute(nodeID int) {
@@ -352,6 +348,36 @@ func onMetadataUpdate(data []byte) {
 	}
 }
 
+func onDelete(pwObj PwObject) {
+	isTypeEmpty := pwObj.Type == ""
+	isInfoNull := len(pwObj.Info) == 0 || string(pwObj.Info) == "null"
+
+	if !(isTypeEmpty && isInfoNull) {
+		return
+	}
+
+	id := pwObj.ID
+
+	go func(id int) {
+		// 推迟清理时间，避免与暂停事件冲突
+		time.Sleep(1500 * time.Millisecond) 
+
+		nodesMu.Lock()
+		if _, exists := GlobalNodes[id]; exists {
+			delete(GlobalNodes, id)
+			zap.L().Debug("已移除节点缓存", zap.Int("id", id))
+		}
+		nodesMu.Unlock()
+
+		devsMu.Lock()
+		if _, exists := GlobalDevices[id]; exists {
+			delete(GlobalDevices, id)
+			zap.L().Debug("已移除设备缓存", zap.Int("id", id))
+		}
+		devsMu.Unlock()
+	}(id)
+}
+
 func dispatcher(rawObjects []json.RawMessage) {
 	for _, raw := range rawObjects {
 		var base PwObject
@@ -365,12 +391,19 @@ func dispatcher(rawObjects []json.RawMessage) {
 			onMetadataUpdate(raw)
 		case "PipeWire:Interface:Device":
 			onDeviceUpdate(raw)
+		default:
+			onDelete(base)
 		}
 	}
 }
 
 func main() {
 	cfg := zap.NewDevelopmentConfig()
+	if os.Getenv("DEBUG") == "1" {
+		cfg.Level = zap.NewAtomicLevelAt(zap.DebugLevel)
+	} else {
+		cfg.Level = zap.NewAtomicLevelAt(zap.InfoLevel)
+	}
 	cfg.EncoderConfig.TimeKey = ""
 	cfg.EncoderConfig.CallerKey = ""
 	logger, _ := cfg.Build()
@@ -408,6 +441,19 @@ func main() {
 	if err := dumpCmd.Start(); err != nil {
 		zap.L().Fatal("无法启动监听进程", zap.Error(err))
 	}
+
+	zap.L().Info("正在连接会话总线...")
+
+	dbusConn, err = dbus.SessionBus()
+	if err != nil {
+		zap.L().Fatal("无法连接会话总线", zap.Error(err))
+	}
+
+	go func() {
+		<-dbusConn.Context().Done()
+		zap.L().Warn("已从会话总线断开")
+		cancel()
+	}()
 
 	go func() {
 		zap.L().Info("正在监听事件...")

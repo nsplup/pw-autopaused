@@ -6,4 +6,4 @@ build:
 	go build -o $(BINARY_NAME) .
 
 dev:
-	go run .
+	DEBUG=1 go run .
