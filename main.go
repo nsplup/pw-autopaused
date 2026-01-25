@@ -20,6 +20,8 @@ var (
 	currentDefaultSink string
 	pwCliStdin io.WriteCloser
 	dbusConn *dbus.Conn
+	triggerDelete func(int)
+	cancelDelete  func(int)
 
 	nodesMu         sync.RWMutex
 	devsMu          sync.RWMutex
@@ -261,6 +263,7 @@ func handleDefaultRouteChange(newDev Device) {
 func onDeviceUpdate(data []byte) {
 	var dev Device
 	if err := json.Unmarshal(data, &dev); err == nil {
+		cancelDelete(dev.ID)
 		handleDefaultRouteChange(dev)
 
 		devsMu.Lock()
@@ -283,6 +286,7 @@ func GetNodeIDByName(nodeName string) (int, bool) {
 func onNodeUpdate(data []byte) {
 	var node Node
 	if err := json.Unmarshal(data, &node); err == nil {
+		cancelDelete(node.ID)
 		nodesMu.Lock()
 		GlobalNodes[node.ID] = node
 		nodesMu.Unlock()
@@ -356,26 +360,54 @@ func onDelete(pwObj PwObject) {
 		return
 	}
 
-	id := pwObj.ID
+	triggerDelete(pwObj.ID)
+}
 
-	go func(id int) {
-		// 推迟清理时间，避免与暂停事件冲突
-		time.Sleep(1500 * time.Millisecond) 
+func StartSmartCleaner(delay time.Duration) (func(int), func(int)) {
+	pendingDelete := make(map[int]time.Time)
+	input := make(chan int, 100)
+	cancelSignal := make(chan int, 100)
 
-		nodesMu.Lock()
-		if _, exists := GlobalNodes[id]; exists {
-			delete(GlobalNodes, id)
-			zap.L().Debug("已移除节点缓存", zap.Int("id", id))
+	go func() {
+		timer := time.NewTimer(delay)
+		if !timer.Stop() {
+			<-timer.C
 		}
-		nodesMu.Unlock()
 
-		devsMu.Lock()
-		if _, exists := GlobalDevices[id]; exists {
-			delete(GlobalDevices, id)
-			zap.L().Debug("已移除设备缓存", zap.Int("id", id))
+		for {
+			select {
+			case id := <-input:
+				pendingDelete[id] = time.Now()
+				timer.Stop()
+				timer.Reset(delay)
+
+			case id := <-cancelSignal:
+				if _, exists := pendingDelete[id]; exists {
+					delete(pendingDelete, id)
+					zap.L().Debug("已从清理队列中移除活跃缓存索引", zap.Int("id", id))
+				}
+				timer.Stop()
+				timer.Reset(delay)
+
+			case <-timer.C:
+				if len(pendingDelete) == 0 {
+					continue
+				}
+				nodesMu.Lock()
+				devsMu.Lock()
+				for id := range pendingDelete {
+					delete(GlobalNodes, id)
+					delete(GlobalDevices, id)
+					zap.L().Debug("清理过期缓存", zap.Int("id", id))
+				}
+				pendingDelete = make(map[int]time.Time)
+				devsMu.Unlock()
+				nodesMu.Unlock()
+			}
 		}
-		devsMu.Unlock()
-	}(id)
+	}()
+
+	return func(id int) { input <- id }, func(id int) { cancelSignal <- id }
 }
 
 func dispatcher(rawObjects []json.RawMessage) {
@@ -454,6 +486,8 @@ func main() {
 		zap.L().Warn("已从会话总线断开")
 		cancel()
 	}()
+
+	triggerDelete, cancelDelete = StartSmartCleaner(2 * time.Second)
 
 	go func() {
 		zap.L().Info("正在监听事件...")
